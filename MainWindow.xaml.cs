@@ -39,6 +39,7 @@ public partial class MainWindow : Window
         SppSlider.ValueChanged += (_, _) => ApplySettings();
         BouncesSlider.ValueChanged += (_, _) => ApplySettings();
         AmbientSlider.ValueChanged += (_, _) => ApplySettings();
+        EmbossSlider.ValueChanged += (_, _) => ApplySettings();
         VsyncCheck.Checked += (_, _) => ApplySettings();
         VsyncCheck.Unchecked += (_, _) => ApplySettings();
 
@@ -122,7 +123,8 @@ public partial class MainWindow : Window
             (int)SppSlider.Value,
             (int)BouncesSlider.Value,
             (float)AmbientSlider.Value,
-            VsyncCheck.IsChecked == true);
+            VsyncCheck.IsChecked == true,
+            (float)EmbossSlider.Value);
     }
 
     private void ResizeRenderer()

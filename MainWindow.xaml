@@ -27,6 +27,9 @@
                 <TextBlock Text="Ambient" Foreground="Gainsboro" Margin="0,10,0,4" />
                 <Slider x:Name="AmbientSlider" Minimum="0" Maximum="0.2" Value="0.03" TickFrequency="0.01" IsSnapToTickEnabled="False" />
 
+                <TextBlock Text="Emboss height" Foreground="Gainsboro" Margin="0,10,0,4" />
+                <Slider x:Name="EmbossSlider" Minimum="0" Maximum="0.8" Value="0.15" TickFrequency="0.02" IsSnapToTickEnabled="False" />
+
                 <CheckBox x:Name="VsyncCheck" Content="VSync" IsChecked="True" Foreground="Gainsboro" Margin="0,10,0,0" />
             </StackPanel>
         </Border>

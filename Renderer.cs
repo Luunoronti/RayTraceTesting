@@ -17,13 +17,17 @@ namespace WinformsApp;
 internal sealed class Renderer : IDisposable
 {
     private const int FrameCount = 2;
-    private const int DescriptorCount = 24;
+    private const int DescriptorCount = 25;
     private const int CbvIndex = 0;
     private const int SrvBaseIndex = 1;
     private const int SrvBufferCount = 5;
     private const int SrvTextureCount = 7;
     private const int SrvGridCount = 3;
-    private const int UavBaseIndex = SrvBaseIndex + SrvBufferCount + SrvTextureCount + SrvGridCount;
+    private const int SrvAtlasCount = 1;
+    private const int UavBaseIndex = SrvBaseIndex + SrvBufferCount + SrvTextureCount + SrvGridCount + SrvAtlasCount;
+    private const int GlyphAtlasCols = 4;
+    private const int GlyphAtlasRows = 4;
+    private const int GlyphCellSize = 64;
 
     private readonly IntPtr _hwnd;
     private readonly ID3D12Device _device;
@@ -82,6 +86,7 @@ internal sealed class Renderer : IDisposable
     private ID3D12Resource _historyTextureB = null!;
     private ID3D12Resource _momentTextureA = null!;
     private ID3D12Resource _momentTextureB = null!;
+    private ID3D12Resource _glyphAtlasTexture = null!;
     private ResourceStates _computeState = ResourceStates.UnorderedAccess;
     private ResourceStates _accumState = ResourceStates.UnorderedAccess;
     private ResourceStates _normalState = ResourceStates.UnorderedAccess;
@@ -95,6 +100,7 @@ internal sealed class Renderer : IDisposable
     private int _maxBounces = 3;
     private float _ambientStrength = 0.03f;
     private bool _vSync = true;
+    private float _embossHeight = 0.15f;
     private readonly Stopwatch _clock = Stopwatch.StartNew();
 
     public Renderer(IntPtr hwnd, int width, int height)
@@ -259,11 +265,12 @@ internal sealed class Renderer : IDisposable
         }
     }
 
-    public void UpdateSettings(int samplesPerPixel, int maxBounces, float ambientStrength, bool vSync)
+    public void UpdateSettings(int samplesPerPixel, int maxBounces, float ambientStrength, bool vSync, float embossHeight)
     {
         samplesPerPixel = Math.Clamp(samplesPerPixel, 1, 8);
         maxBounces = Math.Clamp(maxBounces, 1, 8);
         ambientStrength = Math.Clamp(ambientStrength, 0.0f, 0.2f);
+        embossHeight = Math.Clamp(embossHeight, 0.0f, 0.8f);
 
         if (_samplesPerPixel != samplesPerPixel ||
             _maxBounces != maxBounces ||
@@ -276,6 +283,12 @@ internal sealed class Renderer : IDisposable
         _maxBounces = maxBounces;
         _ambientStrength = ambientStrength;
         _vSync = vSync;
+
+        if (Math.Abs(_embossHeight - embossHeight) > 0.0001f)
+        {
+            _embossHeight = embossHeight;
+            _accumulationFrame = 0;
+        }
     }
 
     public void Resize(int width, int height)
@@ -321,6 +334,7 @@ internal sealed class Renderer : IDisposable
         _historyTextureB.Dispose();
         _momentTextureA.Dispose();
         _momentTextureB.Dispose();
+        _glyphAtlasTexture.Dispose();
         _constantBuffer.Dispose();
         _sphereBuffer.Dispose();
         _planeBuffer.Dispose();
@@ -384,6 +398,7 @@ internal sealed class Renderer : IDisposable
 
         CreateConstantBuffer();
         CreateSceneBuffers();
+        CreateGlyphAtlasTexture();
         CreateComputeTexture();
     }
 
@@ -392,7 +407,7 @@ internal sealed class Renderer : IDisposable
         var ranges = new[]
         {
             new DescriptorRange1(DescriptorRangeType.ConstantBufferView, 1, 0),
-            new DescriptorRange1(DescriptorRangeType.ShaderResourceView, SrvBufferCount + SrvTextureCount + SrvGridCount, 0),
+            new DescriptorRange1(DescriptorRangeType.ShaderResourceView, SrvBufferCount + SrvTextureCount + SrvGridCount + SrvAtlasCount, 0),
             new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 8, 0)
         };
 
@@ -434,11 +449,15 @@ cbuffer Params : register(b0)
     int GridDimX;
     int GridDimY;
     int GridDimZ;
-    float _pad4;
+    float EmbossHeight;
     float3 GridMin;
     float _pad5;
     float3 GridMax;
     float _pad6;
+    int GlyphCols;
+    int GlyphRows;
+    int GlyphCellSize;
+    float _pad7;
 };
 
 struct Sphere
@@ -464,7 +483,8 @@ struct Box
     float3 Max;
     float _pad1;
     int MaterialId;
-    float3 _pad2;
+    int GlyphIndex;
+    float2 _pad2;
 };
 
 struct Material
@@ -499,6 +519,7 @@ Texture2D<float2> MomentB : register(t11);
 StructuredBuffer<int> GridCellStart : register(t12);
 StructuredBuffer<int> GridCellCount : register(t13);
 StructuredBuffer<int> GridIndices : register(t14);
+Texture2D<float> GlyphAtlas : register(t15);
 
 RWTexture2D<float4> Output : register(u0);
 RWTexture2D<float4> Accumulation : register(u1);
@@ -514,6 +535,7 @@ struct HitInfo
     float t;
     float3 normal;
     int materialId;
+    int boxIndex;
 };
 
 HitInfo IntersectScene(float3 rayOrigin, float3 rayDir)
@@ -522,6 +544,7 @@ HitInfo IntersectScene(float3 rayOrigin, float3 rayDir)
     hit.t = 1e30f;
     hit.normal = float3(0, 0, 0);
     hit.materialId = -1;
+    hit.boxIndex = -1;
 
     float3 invDir = 1.0f / rayDir;
     float3 t0 = (GridMin - rayOrigin) * invDir;
@@ -654,15 +677,16 @@ HitInfo IntersectScene(float3 rayOrigin, float3 rayDir)
                 hit.t = tHit;
                 float3 hitPos = rayOrigin + rayDir * tHit;
                 float3 center = (b.Min + b.Max) * 0.5f;
-                float3 local = hitPos - center;
                 float3 extents = (b.Max - b.Min) * 0.5f;
+                float3 local = hitPos - center;
                 float3 n = float3(0, 0, 0);
-                float3 d = abs(local) - extents;
-                if (abs(d.x) > abs(d.y) && abs(d.x) > abs(d.z)) n = float3(sign(local.x), 0, 0);
-                else if (abs(d.y) > abs(d.z)) n = float3(0, sign(local.y), 0);
+                float3 a = abs(local) / max(extents, float3(1e-4f, 1e-4f, 1e-4f));
+                if (a.x >= a.y && a.x >= a.z) n = float3(sign(local.x), 0, 0);
+                else if (a.y >= a.z) n = float3(0, sign(local.y), 0);
                 else n = float3(0, 0, sign(local.z));
                 hit.normal = n;
                 hit.materialId = b.MaterialId;
+                hit.boxIndex = i;
             }
         }
     }
@@ -714,6 +738,70 @@ float3 SampleHemisphere(float3 n, inout uint state)
     float3 bitangent = cross(n, tangent);
     float3 dir = tangent * (r * cos(phi)) + bitangent * (r * sin(phi)) + n * sqrt(1.0f - u1);
     return normalize(dir);
+}
+
+float SampleGlyphSdf(int glyphIndex, float2 uv)
+{
+    if (glyphIndex < 0)
+    {
+        return 1.0f;
+    }
+
+    int cellX = glyphIndex % GlyphCols;
+    int cellY = glyphIndex / GlyphCols;
+    int2 cellOrigin = int2(cellX * GlyphCellSize, cellY * GlyphCellSize);
+
+    float2 clamped = saturate(uv);
+    float2 pixel = clamped * (float)(GlyphCellSize - 1);
+    int2 p0 = int2(pixel);
+    int2 p1 = min(p0 + int2(1, 1), int2(GlyphCellSize - 1, GlyphCellSize - 1));
+    float2 f = frac(pixel);
+
+    int2 basePos = cellOrigin + p0;
+    int2 basePosX = cellOrigin + int2(p1.x, p0.y);
+    int2 basePosY = cellOrigin + int2(p0.x, p1.y);
+    int2 basePosXY = cellOrigin + p1;
+
+    float a = GlyphAtlas.Load(int3(basePos, 0));
+    float b = GlyphAtlas.Load(int3(basePosX, 0));
+    float c = GlyphAtlas.Load(int3(basePosY, 0));
+    float d = GlyphAtlas.Load(int3(basePosXY, 0));
+
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
+float4 ApplyEmboss(int boxIndex, float3 hitPos, float3 normal)
+{
+    if (boxIndex < 0 || normal.y < 0.999f)
+    {
+        return float4(normal, 0.0f);
+    }
+
+    Box b = Boxes[boxIndex];
+    float3 size = b.Max - b.Min;
+    float2 uv = float2((hitPos.x - b.Min.x) / max(size.x, 1e-4f),
+                       (hitPos.z - b.Min.z) / max(size.z, 1e-4f));
+    uv.y = 1.0f - uv.y;
+
+    float sdf = SampleGlyphSdf(b.GlyphIndex, uv);
+    float signedDistance = (sdf - 0.5f) * 2.0f;
+    float emboss = smoothstep(0.05f, -0.05f, signedDistance);
+    if (emboss <= 0.0001f)
+    {
+        return float4(normal, 0.0f);
+    }
+
+    float2 duv = float2(1.0f / (float)GlyphCellSize, 1.0f / (float)GlyphCellSize);
+    float sdfX = SampleGlyphSdf(b.GlyphIndex, uv + float2(duv.x, 0.0f));
+    float sdfY = SampleGlyphSdf(b.GlyphIndex, uv + float2(0.0f, duv.y));
+    float dx = (sdfX - sdf) * 2.0f;
+    float dy = (sdfY - sdf) * 2.0f;
+
+    float heightScale = max(EmbossHeight, 0.001f) * 12.0f;
+    float3 tangent = float3(1, 0, 0);
+    float3 bitangent = float3(0, 0, 1);
+    float3 bumped = normalize(normal + (-dx * heightScale) * tangent + (-dy * heightScale) * bitangent);
+    return float4(bumped, EmbossHeight * emboss * 2.0f);
 }
 
 bool WriteHistoryToA()
@@ -816,6 +904,9 @@ void RayGen(uint3 id : SV_DispatchThreadID)
             Material mat = Materials[hit.materialId];
             float3 hitPos = sOrigin + sDir * hit.t;
             float3 normal = hit.normal;
+            float4 emboss = ApplyEmboss(hit.boxIndex, hitPos, normal);
+            normal = emboss.xyz;
+            hitPos += normal * emboss.w;
             if (bounce == 0 && s == 0)
             {
                 hitDepth = hit.t;
@@ -952,50 +1043,80 @@ void AtrousFilter(uint3 id : SV_DispatchThreadID)
 
     private void CreateSceneBuffers()
     {
-        const int sphereCount = 10_000;
         _gridDimX = 20;
         _gridDimY = 10;
         _gridDimZ = 20;
         _gridMin = new Vector3(-10.0f, -2.0f, 0.0f);
         _gridMax = new Vector3(10.0f, 6.0f, 20.0f);
 
-        var spheres = new Sphere[sphereCount];
-        var rng = new Random(1234);
-        Vector3 gridSize = _gridMax - _gridMin;
-        for (int i = 0; i < sphereCount; i++)
+        var spheres = new[]
         {
-            float radius = 0.15f + (float)rng.NextDouble() * 0.35f;
-            var center = new Vector3(
-                _gridMin.X + radius + (float)rng.NextDouble() * (gridSize.X - radius * 2),
-                _gridMin.Y + radius + (float)rng.NextDouble() * (gridSize.Y - radius * 2),
-                _gridMin.Z + radius + (float)rng.NextDouble() * (gridSize.Z - radius * 2));
-
-            int materialId = rng.Next(0, 6);
-            spheres[i] = new Sphere(center, radius, materialId);
-        }
+            new Sphere(new Vector3(0.0f, 0.3f, 3.0f), 0.6f, 5),
+            new Sphere(new Vector3(1.5f, -0.2f, 4.5f), 0.5f, 1),
+            new Sphere(new Vector3(-1.6f, 0.1f, 3.8f), 0.45f, 2)
+        };
 
         var planes = new[]
         {
-            new Plane(Vector3.UnitY, 1.5f, 1),
-            new Plane(Vector3.UnitZ, 10.0f, 2),
-            new Plane(Vector3.UnitY, 1.0f, 5)
+            new Plane(Vector3.UnitY, 1.5f, 4),
+            new Plane(Vector3.UnitZ, 10.0f, 4),
+            new Plane(Vector3.UnitY, 1.0f, 4)
         };
 
-        var boxes = new[]
+        var boxes = new List<Box>();
+        const int gridSize = 20;
+        const float cellSize = 0.6f;
+        const float boxSize = 0.45f;
+        const float boxHeight = 0.45f;
+        float startX = -gridSize * cellSize * 0.5f;
+        float startZ = 2.5f;
+        float baseY = -1.0f;
+        int glyphHash = GetGlyphIndex('#');
+        int glyphDot = GetGlyphIndex('.');
+        int glyphAt = GetGlyphIndex('@');
+
+        for (int z = 0; z < gridSize; z++)
         {
-            new Box(new Vector3(-1.5f, -0.5f, 4.0f), new Vector3(-0.5f, 0.5f, 5.0f), 2),
-            new Box(new Vector3(0.8f, -1.0f, 2.8f), new Vector3(1.6f, -0.2f, 3.6f), 5),
-            new Box(new Vector3(-3.0f, -1.0f, 6.0f), new Vector3(-2.2f, 0.2f, 6.8f), 6)
-        };
+            for (int x = 0; x < gridSize; x++)
+            {
+                bool isAt = (x == gridSize / 2) && (z == gridSize / 2);
+                bool isPath = (z == gridSize / 2 && x >= 2 && x <= gridSize - 3) ||
+                              (x == gridSize - 3 && z >= gridSize / 2 && z <= gridSize - 2);
+                bool isHash = ((x + z) % 7) == 0;
+
+                int glyphIndex = glyphDot;
+                int materialId = 2;
+
+                if (isAt)
+                {
+                    glyphIndex = glyphAt;
+                    materialId = 1;
+                }
+                else if (isPath)
+                {
+                    glyphIndex = glyphDot;
+                    materialId = 3;
+                }
+                else if (isHash)
+                {
+                    glyphIndex = glyphHash;
+                    materialId = 0;
+                }
+
+                var min = new Vector3(startX + x * cellSize, baseY, startZ + z * cellSize);
+                var max = new Vector3(min.X + boxSize, baseY + boxHeight, min.Z + boxSize);
+                boxes.Add(new Box(min, max, materialId, glyphIndex));
+            }
+        }
 
         var materials = new[]
         {
-            new Material(new Vector3(0.7f, 0.2f, 0.2f), 0.15f, 0.0f, 0.0f),
-            new Material(new Vector3(0.2f, 0.7f, 0.2f), 0.6f, 0.0f, 0.0f),
-            new Material(new Vector3(0.2f, 0.2f, 0.7f), 0.05f, 0.0f, 0.0f),
-            new Material(new Vector3(0.9f, 0.9f, 0.9f), 0.3f, 1.0f, 0.0f),
-            new Material(new Vector3(0.9f, 0.7f, 0.2f), 0.7f, 0.6f, 0.0f),
-            new Material(new Vector3(0.95f, 0.95f, 0.95f), 0.1f, 1.0f, 0.0f)
+            new Material(new Vector3(0.45f, 0.05f, 0.05f), 0.2f, 1.0f, 0.0f),
+            new Material(new Vector3(0.1f, 0.2f, 0.9f), 0.2f, 1.0f, 0.0f),
+            new Material(new Vector3(0.9f, 0.9f, 0.9f), 0.25f, 1.0f, 0.0f),
+            new Material(new Vector3(0.1f, 0.8f, 0.2f), 0.25f, 1.0f, 0.0f),
+            new Material(new Vector3(0.2f, 0.2f, 0.22f), 0.8f, 0.0f, 0.0f),
+            new Material(new Vector3(0.7f, 0.7f, 0.7f), 0.05f, 1.0f, 0.0f)
         };
 
         var lights = new[]
@@ -1006,7 +1127,8 @@ void AtrousFilter(uint3 id : SV_DispatchThreadID)
 
         _sphereCount = spheres.Length;
         _planeCount = planes.Length;
-        _boxCount = boxes.Length;
+        var boxArray = boxes.ToArray();
+        _boxCount = boxArray.Length;
         _lightCount = lights.Length;
 
         ID3D12Resource sphereUpload = null!;
@@ -1020,7 +1142,7 @@ void AtrousFilter(uint3 id : SV_DispatchThreadID)
 
         _sphereBuffer = CreateDefaultBuffer(spheres, out sphereUpload);
         _planeBuffer = CreateDefaultBuffer(planes, out planeUpload);
-        _boxBuffer = CreateDefaultBuffer(boxes, out boxUpload);
+        _boxBuffer = CreateDefaultBuffer(boxArray, out boxUpload);
         _materialBuffer = CreateDefaultBuffer(materials, out materialUpload);
         _lightBuffer = CreateDefaultBuffer(lights, out lightUpload);
         BuildGrid(spheres, out int[] cellStart, out int[] cellCount, out int[] indices);
@@ -1253,6 +1375,17 @@ void AtrousFilter(uint3 id : SV_DispatchThreadID)
         _device.CreateShaderResourceView(_momentTextureA, momentSrvDesc, GetCpuHandle(srvIndex++));
         _device.CreateShaderResourceView(_momentTextureB, momentSrvDesc, GetCpuHandle(srvIndex++));
 
+        var glyphSrvDesc = new ShaderResourceViewDescription
+        {
+            ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+            Shader4ComponentMapping = 0x1688,
+            Format = Format.R8_UNorm,
+            Texture2D = new Texture2DShaderResourceView { MipLevels = 1, MostDetailedMip = 0 }
+        };
+
+        int glyphSrvIndex = SrvBaseIndex + SrvBufferCount + SrvTextureCount + SrvGridCount;
+        _device.CreateShaderResourceView(_glyphAtlasTexture, glyphSrvDesc, GetCpuHandle(glyphSrvIndex));
+
         _computeState = ResourceStates.UnorderedAccess;
         _accumState = ResourceStates.UnorderedAccess;
         _normalState = ResourceStates.UnorderedAccess;
@@ -1384,8 +1517,12 @@ void AtrousFilter(uint3 id : SV_DispatchThreadID)
             _gridDimX,
             _gridDimY,
             _gridDimZ,
+            _embossHeight,
             _gridMin,
-            _gridMax);
+            _gridMax,
+            GlyphAtlasCols,
+            GlyphAtlasRows,
+            GlyphCellSize);
         var mapped = _constantBuffer.Map<byte>(0, _constantBufferSize);
         MemoryMarshal.Write(mapped, in data);
         _constantBuffer.Unmap(0);
@@ -1416,11 +1553,15 @@ void AtrousFilter(uint3 id : SV_DispatchThreadID)
         public readonly int GridDimX;
         public readonly int GridDimY;
         public readonly int GridDimZ;
-        private readonly float _pad3;
+        public readonly float EmbossHeight;
         public readonly Vector3 GridMin;
         private readonly float _pad4;
         public readonly Vector3 GridMax;
         private readonly float _pad5;
+        public readonly int GlyphCols;
+        public readonly int GlyphRows;
+        public readonly int GlyphCellSize;
+        private readonly float _pad6;
 
         public ComputeParams(
             float time,
@@ -1440,8 +1581,12 @@ void AtrousFilter(uint3 id : SV_DispatchThreadID)
             int gridDimX,
             int gridDimY,
             int gridDimZ,
+            float embossHeight,
             Vector3 gridMin,
-            Vector3 gridMax)
+            Vector3 gridMax,
+            int glyphCols,
+            int glyphRows,
+            int glyphCellSize)
         {
             Time = time;
             SphereCount = sphereCount;
@@ -1463,11 +1608,15 @@ void AtrousFilter(uint3 id : SV_DispatchThreadID)
             GridDimX = gridDimX;
             GridDimY = gridDimY;
             GridDimZ = gridDimZ;
-            _pad3 = 0f;
+            EmbossHeight = embossHeight;
             GridMin = gridMin;
             _pad4 = 0f;
             GridMax = gridMax;
             _pad5 = 0f;
+            GlyphCols = glyphCols;
+            GlyphRows = glyphRows;
+            GlyphCellSize = glyphCellSize;
+            _pad6 = 0f;
         }
     }
 
@@ -1525,15 +1674,17 @@ void AtrousFilter(uint3 id : SV_DispatchThreadID)
         public readonly Vector3 Max;
         private readonly float _pad1;
         public readonly int MaterialId;
-        private readonly Vector3 _pad2;
+        public readonly int GlyphIndex;
+        private readonly Vector2 _pad2;
 
-        public Box(Vector3 min, Vector3 max, int materialId)
+        public Box(Vector3 min, Vector3 max, int materialId, int glyphIndex)
         {
             Min = min;
             _pad0 = 0f;
             Max = max;
             _pad1 = 0f;
             MaterialId = materialId;
+            GlyphIndex = glyphIndex;
             _pad2 = default;
         }
     }
@@ -1690,6 +1841,393 @@ void AtrousFilter(uint3 id : SV_DispatchThreadID)
             list.CopyTo(indices, offset);
             offset += list.Count;
         }
+    }
+
+    private static readonly char[] GlyphChars =
+    {
+        '#', '.', '@', 'A',
+        'B', 'C', 'D', 'E',
+        'F', '0', '1', '2',
+        '3', '4', '5', '6'
+    };
+
+    private static int GetGlyphIndex(char c)
+    {
+        for (int i = 0; i < GlyphChars.Length; i++)
+        {
+            if (GlyphChars[i] == c)
+            {
+                return i;
+            }
+        }
+
+        return 0;
+    }
+
+    private void CreateGlyphAtlasTexture()
+    {
+        _glyphAtlasTexture?.Dispose();
+
+        int width = GlyphAtlasCols * GlyphCellSize;
+        int height = GlyphAtlasRows * GlyphCellSize;
+        byte[] atlas = BuildGlyphAtlas(width, height);
+
+        var desc = ResourceDescription.Texture2D(
+            Format.R8_UNorm,
+            (ulong)width,
+            height,
+            1,
+            1,
+            1,
+            0,
+            ResourceFlags.None);
+
+        _glyphAtlasTexture = _device.CreateCommittedResource(
+            new HeapProperties(HeapType.Default),
+            HeapFlags.None,
+            desc,
+            ResourceStates.CopyDestination);
+
+        var layouts = new PlacedSubresourceFootPrint[1];
+        var numRows = new int[1];
+        var rowSizes = new ulong[1];
+        _device.GetCopyableFootprints(desc, 0, 1, 0, layouts, numRows, rowSizes, out ulong totalBytes);
+
+        using var upload = _device.CreateCommittedResource(
+            new HeapProperties(HeapType.Upload),
+            HeapFlags.None,
+            ResourceDescription.Buffer((ulong)totalBytes),
+            ResourceStates.GenericRead);
+
+        Span<byte> mapped = upload.Map<byte>(0, (int)totalBytes);
+        int rowPitch = layouts[0].Footprint.RowPitch;
+        for (int y = 0; y < height; y++)
+        {
+            atlas.AsSpan(y * width, width).CopyTo(mapped.Slice(y * rowPitch, width));
+        }
+        upload.Unmap(0);
+
+        _commandAllocator.Reset();
+        _commandList.Reset(_commandAllocator, null);
+
+        var dst = new TextureCopyLocation(_glyphAtlasTexture, 0);
+        var src = new TextureCopyLocation(upload, layouts[0]);
+        _commandList.CopyTextureRegion(dst, 0, 0, 0, src, null);
+        _commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            _glyphAtlasTexture,
+            ResourceStates.CopyDestination,
+            ResourceStates.NonPixelShaderResource));
+
+        _commandList.Close();
+        _commandQueue.ExecuteCommandLists(new[] { _commandList });
+        WaitForGpu();
+    }
+
+    private static byte[] BuildGlyphAtlas(int width, int height)
+    {
+        var atlas = new byte[width * height];
+
+        for (int i = 0; i < GlyphChars.Length; i++)
+        {
+            int cellX = i % GlyphAtlasCols;
+            int cellY = i / GlyphAtlasCols;
+            string[]? pattern = GetGlyphPattern(GlyphChars[i]);
+
+            byte[] cell = pattern == null
+                ? BuildEmptyCell(GlyphCellSize)
+                : BuildGlyphSdf(pattern, GlyphCellSize);
+
+            for (int y = 0; y < GlyphCellSize; y++)
+            {
+                int dstRow = (cellY * GlyphCellSize + y) * width;
+                int srcRow = y * GlyphCellSize;
+                Buffer.BlockCopy(cell, srcRow, atlas, dstRow + cellX * GlyphCellSize, GlyphCellSize);
+            }
+        }
+
+        return atlas;
+    }
+
+    private static byte[] BuildEmptyCell(int cellSize)
+    {
+        var cell = new byte[cellSize * cellSize];
+        for (int i = 0; i < cell.Length; i++)
+        {
+            cell[i] = 255;
+        }
+
+        return cell;
+    }
+
+    private static byte[] BuildGlyphSdf(string[] pattern, int cellSize)
+    {
+        int patternHeight = pattern.Length;
+        int patternWidth = pattern[0].Length;
+        int padding = Math.Max(2, cellSize / 8);
+        int drawWidth = Math.Max(1, cellSize - padding * 2);
+        int drawHeight = Math.Max(1, cellSize - padding * 2);
+
+        var mask = new bool[cellSize * cellSize];
+        for (int y = 0; y < cellSize; y++)
+        {
+            for (int x = 0; x < cellSize; x++)
+            {
+                bool on = false;
+                if (x >= padding && x < cellSize - padding && y >= padding && y < cellSize - padding)
+                {
+                    int gx = (x - padding) * patternWidth / drawWidth;
+                    int gy = (y - padding) * patternHeight / drawHeight;
+                    gx = Math.Clamp(gx, 0, patternWidth - 1);
+                    gy = Math.Clamp(gy, 0, patternHeight - 1);
+                    on = pattern[gy][gx] == 'X';
+                }
+
+                mask[y * cellSize + x] = on;
+            }
+        }
+
+        var boundary = new List<(int X, int Y)>();
+        for (int y = 0; y < cellSize; y++)
+        {
+            for (int x = 0; x < cellSize; x++)
+            {
+                bool center = mask[y * cellSize + x];
+                bool different = false;
+                if (x > 0 && mask[y * cellSize + x - 1] != center) different = true;
+                else if (x < cellSize - 1 && mask[y * cellSize + x + 1] != center) different = true;
+                else if (y > 0 && mask[(y - 1) * cellSize + x] != center) different = true;
+                else if (y < cellSize - 1 && mask[(y + 1) * cellSize + x] != center) different = true;
+
+                if (different)
+                {
+                    boundary.Add((x, y));
+                }
+            }
+        }
+
+        if (boundary.Count == 0)
+        {
+            return BuildEmptyCell(cellSize);
+        }
+
+        var result = new byte[cellSize * cellSize];
+        float spread = cellSize * 0.18f;
+        float invSpread = 1.0f / MathF.Max(1e-4f, spread);
+
+        for (int y = 0; y < cellSize; y++)
+        {
+            for (int x = 0; x < cellSize; x++)
+            {
+                bool inside = mask[y * cellSize + x];
+                float minDistSq = float.MaxValue;
+                foreach (var b in boundary)
+                {
+                    float dx = x - b.X;
+                    float dy = y - b.Y;
+                    float distSq = dx * dx + dy * dy;
+                    if (distSq < minDistSq)
+                    {
+                        minDistSq = distSq;
+                    }
+                }
+
+                float dist = MathF.Sqrt(minDistSq);
+                float signed = inside ? -dist : dist;
+                float normalized = 0.5f + (signed * invSpread) * 0.5f;
+                normalized = Math.Clamp(normalized, 0.0f, 1.0f);
+                result[y * cellSize + x] = (byte)(normalized * 255.0f + 0.5f);
+            }
+        }
+
+        return result;
+    }
+
+    private static string[]? GetGlyphPattern(char c)
+    {
+        return c switch
+        {
+            '#' => new[]
+            {
+                "X.X.X",
+                "X.X.X",
+                "XXXXX",
+                "X.X.X",
+                "XXXXX",
+                "X.X.X",
+                "X.X.X"
+            },
+            '.' => new[]
+            {
+                ".....",
+                ".....",
+                ".....",
+                "..X..",
+                ".....",
+                ".....",
+                "....."
+            },
+            '@' => new[]
+            {
+                ".XXX.",
+                "X...X",
+                "X.XXX",
+                "X.X.X",
+                "X..XX",
+                ".XXXX",
+                "....."
+            },
+            'A' => new[]
+            {
+                ".XXX.",
+                "X...X",
+                "X...X",
+                "XXXXX",
+                "X...X",
+                "X...X",
+                "X...X"
+            },
+            'B' => new[]
+            {
+                "XXXX.",
+                "X...X",
+                "X...X",
+                "XXXX.",
+                "X...X",
+                "X...X",
+                "XXXX."
+            },
+            'C' => new[]
+            {
+                ".XXXX",
+                "X....",
+                "X....",
+                "X....",
+                "X....",
+                "X....",
+                ".XXXX"
+            },
+            'D' => new[]
+            {
+                "XXXX.",
+                "X...X",
+                "X...X",
+                "X...X",
+                "X...X",
+                "X...X",
+                "XXXX."
+            },
+            'E' => new[]
+            {
+                "XXXXX",
+                "X....",
+                "X....",
+                "XXXX.",
+                "X....",
+                "X....",
+                "XXXXX"
+            },
+            'F' => new[]
+            {
+                "XXXXX",
+                "X....",
+                "X....",
+                "XXXX.",
+                "X....",
+                "X....",
+                "X...."
+            },
+            '0' => new[]
+            {
+                "XXXXX",
+                "X...X",
+                "X...X",
+                "X...X",
+                "X...X",
+                "X...X",
+                "XXXXX"
+            },
+            '1' => new[]
+            {
+                "..X..",
+                ".XX..",
+                "..X..",
+                "..X..",
+                "..X..",
+                "..X..",
+                ".XXX."
+            },
+            '2' => new[]
+            {
+                "XXXXX",
+                "....X",
+                "....X",
+                "XXXXX",
+                "X....",
+                "X....",
+                "XXXXX"
+            },
+            '3' => new[]
+            {
+                "XXXXX",
+                "....X",
+                "....X",
+                "XXXXX",
+                "....X",
+                "....X",
+                "XXXXX"
+            },
+            '4' => new[]
+            {
+                "X...X",
+                "X...X",
+                "X...X",
+                "XXXXX",
+                "....X",
+                "....X",
+                "....X"
+            },
+            '5' => new[]
+            {
+                "XXXXX",
+                "X....",
+                "X....",
+                "XXXXX",
+                "....X",
+                "....X",
+                "XXXXX"
+            },
+            '6' => new[]
+            {
+                "XXXXX",
+                "X....",
+                "X....",
+                "XXXXX",
+                "X...X",
+                "X...X",
+                "XXXXX"
+            },
+            '7' => new[]
+            {
+                "XXXXX",
+                "....X",
+                "...X.",
+                "..X..",
+                ".X...",
+                ".X...",
+                ".X..."
+            },
+            '8' => new[]
+            {
+                "XXXXX",
+                "X...X",
+                "X...X",
+                "XXXXX",
+                "X...X",
+                "X...X",
+                "XXXXX"
+            },
+            _ => null
+        };
     }
 
     private void Transition(ID3D12Resource resource, ref ResourceStates current, ResourceStates next)
